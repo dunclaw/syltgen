@@ -1,0 +1,20 @@
+* text=auto
+
+# Keep Windows scripts with CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# Keep Python/Markdown with LF
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary assets
+*.mp3 binary
+*.wav binary
+*.flac binary
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary

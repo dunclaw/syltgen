@@ -1,0 +1,38 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.log
+
+# Python caches/tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / workspace noise
+*.code-workspace
+.idea/
+
+# Local env files
+.env
+.env.*
+
+# Stem separation temp files
+*_stems/
+*.wav
+
+# Input/output directories (not committed)
+input/
+output/
+
+# VSCode local overrides
+.vscode/extensions.json

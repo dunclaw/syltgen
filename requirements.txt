@@ -1,0 +1,26 @@
+# ============================================================
+# syltgen dependencies
+#
+# IMPORTANT: Python 3.10, 3.11, or 3.12 required.
+# WhisperX does NOT support Python 3.14+.
+#
+# Install order (run setup.ps1 or follow README steps):
+#   1. pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+#   2. pip install -r requirements.txt
+# ============================================================
+
+# Core audio tagging
+mutagen>=1.47.0
+
+# Vocal stem separation (Demucs / UVR-MDX-NET backend)
+# Use [cpu] instead of [gpu] if you do not have an NVIDIA GPU
+audio-separator[gpu]>=0.27.0
+
+# Transcription + forced alignment
+# Requires Python >=3.10,<3.14
+whisperx>=3.1.0
+
+# Utilities
+tqdm>=4.66.0
+colorlog>=6.8.0
+Pillow>=10.0.0

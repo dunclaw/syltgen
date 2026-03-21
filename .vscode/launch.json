@@ -1,0 +1,63 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Process directory",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "syltgen.main",
+            "args": [
+                "c:/Users/duncl/Music",
+                "e:/Temp/FullOutput",
+                "--verbose"
+            ],
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "justMyCode": false,
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Process directory (CPU, no GPU)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "syltgen.main",
+            "args": [
+                "./input",
+                "./output",
+                "--device", "cpu",
+                "--compute-type", "float32",
+                "--verbose"
+            ],
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "justMyCode": false,
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Process directory (force re-tag)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "syltgen.main",
+            "args": [
+                "./input",
+                "./output",
+                "--force",
+                "--verbose"
+            ],
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "justMyCode": false,
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "console": "integratedTerminal"
+        }
+    ]
+}
