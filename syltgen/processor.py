@@ -39,7 +39,7 @@ def _is_viable_manual_lrc(segments: list[dict]) -> bool:
 
 
 def _is_instrumental_or_classical_genre(mp3_path: Path) -> bool:
-    """Return True when ID3 genre metadata indicates non-lyrical content."""
+    """Return True when metadata strongly indicates non-lyrical content."""
     try:
         from mutagen.id3 import ID3
         tags = ID3(str(mp3_path))
@@ -54,11 +54,34 @@ def _is_instrumental_or_classical_genre(mp3_path: Path) -> bool:
         elif isinstance(text, (list, tuple)):
             genres.extend(str(x) for x in text)
 
+    artists: list[str] = []
+    for frame in tags.getall("TPE1"):
+        text = frame.text
+        if isinstance(text, str):
+            artists.append(text)
+        elif isinstance(text, (list, tuple)):
+            artists.extend(str(x) for x in text)
+
+    albums: list[str] = []
+    for frame in tags.getall("TALB"):
+        text = frame.text
+        if isinstance(text, str):
+            albums.append(text)
+        elif isinstance(text, (list, tuple)):
+            albums.extend(str(x) for x in text)
+
     if not genres:
         return False
 
     normalized = " | ".join(genres).lower()
-    return ("instrumental" in normalized) or ("classical" in normalized)
+    if ("instrumental" in normalized) or ("classical" in normalized):
+        return True
+
+    meta_blob = " | ".join(genres + artists + albums).lower()
+    if "christmas" in normalized and any(token in meta_blob for token in ("piano", "instrumental", "karaoke", "unknown artist")):
+        return True
+
+    return False
 
 
 def _shrink_cover_art_if_needed(mp3_path: Path) -> None:

@@ -240,6 +240,17 @@ def _looks_probably_instrumental(segments: list[dict]) -> bool:
 
     symbolic_ratio = short_or_symbolic_segments / max(1, textful_segments)
     if (
+        timed_duration >= 20.0
+        and textful_segments <= 5
+        and alpha_word_count <= 14
+        and lexical_density < 0.20
+        and mean_logprob <= -0.6
+        and symbolic_ratio >= 0.75
+        and contentful_word_count <= 5
+    ):
+        return True
+
+    if (
         timed_duration >= 120.0
         and textful_segments <= 12
         and alpha_word_count <= 28
@@ -633,18 +644,28 @@ def _normalize_token(token: str) -> str:
     return re.sub(r"[^a-z']", "", token.lower().replace("\u2019", "'"))
 
 
+_MATCH_MIN_SCORE = 0.25  # Lines scoring below this are treated as unmatched
+
+
 def _align_uslt_to_transcribed_words(
     uslt_lines: list[str],
     timed_words: list[dict],
 ) -> list[dict]:
     """Match USLT lyric lines to transcribed word timestamps.
 
-    For each USLT line the best-matching consecutive sequence of transcribed
-    words is found by greedy forward search with fuzzy scoring.  The line is
-    assigned the *start* timestamp of its first matched word, so timing accuracy
-    depends entirely on WhisperX word alignment rather than coarse-segment
-    seeding — eliminating the progressive drift that accumulates when seed
-    windows stretch across musical gaps.
+    Two-pass algorithm:
+
+    Pass 1 — greedy forward search with a generous look-ahead window.  For each
+    USLT line we search up to ``_SEARCH_WINDOW`` words ahead of the current
+    cursor for the best-matching word sequence.  If the best score is below
+    ``_MATCH_MIN_SCORE`` (the line was not transcribed, or Whisper used
+    significantly different wording) we mark the line as *unmatched* and
+    **freeze the cursor** so subsequent lines can still find their real words.
+
+    Pass 2 — interpolate timestamps for unmatched lines.  Each unmatched line's
+    timestamp is linearly interpolated from the nearest matched anchor lines
+    before and after it, so the display timing is still musically reasonable
+    rather than clustered at the wrong position.
     """
     if not timed_words:
         return []
@@ -652,46 +673,34 @@ def _align_uslt_to_transcribed_words(
     n_words = len(timed_words)
     norm_trans = [_normalize_token(w["token"]) for w in timed_words]
 
-    result: list[dict] = []
+    # ── Pass 1: greedy match with cursor freeze on poor scores ──────────────
+    _SEARCH_WINDOW = 100  # words ahead to search; large enough for instrumental gaps
+
+    anchors: list[dict] = []  # text, start, end, matched (bool)
     word_cursor = 0
 
-    for line_idx, line in enumerate(uslt_lines):
-        if word_cursor >= n_words:
-            last_start = float(timed_words[-1]["start"])
-            last_end = float(timed_words[-1]["end"])
-            result.append({"text": line, "start": last_start, "end": last_end})
-            continue
-
+    for line in uslt_lines:
         line_tokens = [
             _normalize_token(t)
             for t in re.findall(r"[A-Za-z']+", line)
             if t.strip()
         ]
 
-        if not line_tokens:
-            prev_start = result[-1]["start"] if result else timed_words[0]["start"]
-            prev_end = result[-1]["end"] if result else timed_words[0]["end"]
-            result.append({"text": line, "start": prev_start, "end": prev_end})
+        # Lines with no alphabetic content (e.g. pure symbols / music notes)
+        # are left unmatched so cursor isn't perturbed.
+        if not line_tokens or word_cursor >= n_words:
+            anchors.append({"text": line, "start": -1.0, "end": -1.0, "matched": False})
             continue
 
         n_line = len(line_tokens)
-        remaining_uslt = max(1, len(uslt_lines) - line_idx - 1)
-        remaining_words = max(1, n_words - word_cursor)
+        search_limit = min(n_words - word_cursor, max(n_line * 8, _SEARCH_WINDOW))
 
-        # How far ahead to search for this line's first word.  Leave enough
-        # words downstream for remaining USLT lines so we don't over-consume.
-        words_per_remaining = max(1, remaining_words // max(1, remaining_uslt))
-        skip_budget = min(
-            remaining_words - max(0, remaining_uslt - 1),
-            max(n_line * 2, words_per_remaining * 3),
-        )
-
-        start_floor = min(max(0, word_cursor), n_words - 1)
+        start_floor = min(word_cursor, n_words - 1)
         best_score = -1.0
         best_start_idx = start_floor
         best_end_idx = min(start_floor + n_line - 1, n_words - 1)
 
-        for skip in range(max(0, skip_budget) + 1):
+        for skip in range(search_limit + 1):
             start_idx = word_cursor + skip
             if start_idx >= n_words:
                 break
@@ -707,26 +716,82 @@ def _align_uslt_to_transcribed_words(
                 if end_idx >= n_words:
                     break
 
-                score = difflib.SequenceMatcher(
+                sm = difflib.SequenceMatcher(
                     None, line_tokens, norm_trans[start_idx : end_idx + 1]
-                ).ratio()
-                # Small penalty for skipping transcribed words so we prefer
-                # the earliest good match when scores are otherwise equal.
-                score -= skip * 0.015
+                )
+                ratio = sm.ratio()
+                # Weight by coverage: fraction of the USLT line's tokens that
+                # were actually matched.  This suppresses spurious matches where
+                # only a single stop-word (e.g. "and") aligns while the rest of
+                # the line is absent from the transcript.
+                matched_from_line = sum(sz for _, _, sz in sm.get_matching_blocks())
+                coverage = matched_from_line / n_line
+                score = ratio * max(0.5, coverage)
+                # Tiny penalty for skipping so we prefer the earliest good
+                # match when scores are otherwise equal.
+                score -= skip * 0.005
 
                 if score > best_score:
                     best_score = score
                     best_start_idx = start_idx
                     best_end_idx = end_idx
 
-        result.append({
-            "text": line,
-            "start": timed_words[best_start_idx]["start"],
-            "end": timed_words[best_end_idx]["end"],
-        })
-        word_cursor = min(best_end_idx + 1, n_words)
+        if best_score >= _MATCH_MIN_SCORE:
+            anchors.append({
+                "text": line,
+                "start": float(timed_words[best_start_idx]["start"]),
+                "end": float(timed_words[best_end_idx]["end"]),
+                "matched": True,
+            })
+            word_cursor = min(best_end_idx + 1, n_words)
+        else:
+            # No confident match — freeze cursor so downstream lines can still
+            # find their real words.
+            anchors.append({"text": line, "start": -1.0, "end": -1.0, "matched": False})
 
-    return result
+    # ── Pass 2: interpolate timestamps for unmatched lines ──────────────────
+    matched_pairs = [(i, a["start"]) for i, a in enumerate(anchors) if a["matched"]]
+
+    if not matched_pairs:
+        # Absolute fallback: spread evenly over audio duration.
+        total_dur = float(timed_words[-1]["end"])
+        n = max(1, len(anchors))
+        for k, a in enumerate(anchors):
+            a["start"] = total_dur * k / n
+            a["end"] = total_dur * (k + 1) / n
+        return [{"text": a["text"], "start": a["start"], "end": a["end"]} for a in anchors]
+
+    for i, anchor in enumerate(anchors):
+        if anchor["matched"]:
+            continue
+
+        # Find nearest matched anchor before and after position i.
+        prev_match: tuple[int, float] | None = None
+        next_match: tuple[int, float] | None = None
+        for j, t in matched_pairs:
+            if j < i:
+                prev_match = (j, t)   # keep updating → gets the closest one before i
+            elif j > i and next_match is None:
+                next_match = (j, t)   # first one after i
+                break
+
+        if prev_match is None and next_match is None:
+            anchor["start"] = float(timed_words[0]["start"])
+        elif prev_match is None:
+            nj, nt = next_match  # type: ignore[misc]
+            anchor["start"] = max(0.0, nt - (nj - i) * 1.5)
+        elif next_match is None:
+            pj, pt = prev_match  # type: ignore[misc]
+            anchor["start"] = pt + (i - pj) * 2.0
+        else:
+            pj, pt = prev_match  # type: ignore[misc]
+            nj, nt = next_match  # type: ignore[misc]
+            frac = (i - pj) / max(1, nj - pj)
+            anchor["start"] = pt + frac * (nt - pt)
+
+        anchor["end"] = anchor["start"] + 2.0
+
+    return [{"text": a["text"], "start": a["start"], "end": a["end"]} for a in anchors]
 
 
 def _fallback_split_without_word_times(seg: dict, *, target_words: int, max_words: int) -> list[dict]:
