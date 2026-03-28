@@ -103,6 +103,12 @@ def _setup_logging(verbose: bool) -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    logging.getLogger("numba").setLevel(logging.WARNING)
+    logging.getLogger("torio").setLevel(logging.WARNING)
+    logging.getLogger("torchaudio").setLevel(logging.WARNING)
+    logging.getLogger("lightning").setLevel(logging.WARNING)
+    logging.getLogger("pytorch_lightning").setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------

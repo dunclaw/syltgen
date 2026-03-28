@@ -170,6 +170,8 @@ def _looks_probably_instrumental(segments: list[dict]) -> bool:
     unique_words: set[str] = set()
     non_filler_word_count = 0
     contentful_word_count = 0
+    short_alpha_word_count = 0
+    max_words_in_segment = 0
     timed_duration = 0.0
 
     for seg in segments:
@@ -185,9 +187,11 @@ def _looks_probably_instrumental(segments: list[dict]) -> bool:
         words = re.findall(r"[A-Za-z']+", text)
         meaningful_words = [w for w in words if re.search(r"[A-Za-z]", w)]
         alpha_word_count += len(meaningful_words)
+        max_words_in_segment = max(max_words_in_segment, len(meaningful_words))
         alpha_char_count += sum(len(w) for w in meaningful_words)
         normalized_words = [w.lower() for w in meaningful_words]
         unique_words.update(normalized_words)
+        short_alpha_word_count += sum(1 for w in normalized_words if len(w) <= 2)
         non_filler_word_count += sum(1 for w in normalized_words if w not in _LIKELY_FILLER_WORDS)
         contentful_word_count += sum(
             1
@@ -221,6 +225,7 @@ def _looks_probably_instrumental(segments: list[dict]) -> bool:
         return True
 
     lexical_density = alpha_word_count / max(1.0, timed_duration)
+    short_token_ratio = short_alpha_word_count / max(1, alpha_word_count)
     if (
         timed_duration >= 20.0
         and lexical_density < 0.20
@@ -257,6 +262,90 @@ def _looks_probably_instrumental(segments: list[dict]) -> bool:
         and lexical_density < 0.18
         and mean_logprob <= -0.85
         and (symbolic_ratio >= 0.34 or contentful_word_count <= 6)
+    ):
+        return True
+
+    # Very long tracks with only repeated stop-words / scraps (e.g. "and and",
+    # "the the", "so") are strong instrumental hallucination candidates.
+    if (
+        timed_duration >= 90.0
+        and textful_segments <= 16
+        and alpha_word_count <= 20
+        and lexical_density < 0.10
+        and mean_logprob <= -1.35
+        and symbolic_ratio >= 0.85
+        and contentful_word_count == 0
+        and len(unique_words) <= 6
+    ):
+        return True
+
+    # Sparse tiny-line outputs from separated stems (e.g. "Bye.", "you",
+    # "Ooh ooh", "Hmm.") are usually instrumental bleed-through, not lyrics.
+    if (
+        timed_duration >= 4.0
+        and textful_segments <= 10
+        and max_words_in_segment <= 3
+        and alpha_word_count <= 24
+        and contentful_word_count <= 3
+        and len(unique_words) <= 12
+        and mean_logprob <= -0.45
+    ):
+        return True
+
+    # Repetitive syllabic babble ("da-da-da", "y-y-y") from stems can yield
+    # many alphabetic tokens, but almost all are very short and non-contentful.
+    if (
+        timed_duration >= 60.0
+        and textful_segments <= 14
+        and short_token_ratio >= 0.68
+        and contentful_word_count <= 2
+        and len(unique_words) <= 12
+        and mean_logprob <= -0.20
+    ):
+        return True
+
+    # Ultra-sparse outputs: a few isolated fragments ("you I'll be right back",
+    # "I can't", etc.) across the entire track. Usually instrumental hallucinations
+    # or non-lyrical content (dialogue, environmental noise) that mistakenly made it
+    # through stem separation or initial detection. These produce essentially no
+    # usable SYLT content anyway.
+    if (
+        textful_segments <= 5
+        and alpha_word_count <= 15
+        and mean_logprob <= -0.40
+    ):
+        return True
+
+    # Long tracks that only produce a tiny amount of text are almost always
+    # instrumental for our pipeline purposes, even when confidence is not very low.
+    # This catches cases where Whisper emits a few dialogue-like scraps over many
+    # minutes of music (e.g. "I can't", "you", "So, um um you").
+    if (
+        timed_duration >= 45.0
+        and textful_segments <= 8
+        and alpha_word_count <= 24
+        and (contentful_word_count <= 8 or len(unique_words) <= 14)
+    ):
+        return True
+
+    # Extremely sparse long-track output (only a couple of lines over >1.5 min)
+    # is not useful lyric material and is almost always instrumental hallucination.
+    if (
+        timed_duration >= 90.0
+        and textful_segments <= 3
+        and alpha_word_count <= 26
+    ):
+        return True
+
+    # Highly repetitive low-content hallucinations: many repeated words but almost
+    # all from filler vocabulary (e.g., "a baby a baby a baby" repeated, "um um um").  
+    # Real lyrics would have diverse vocabulary and meaningful word content.
+    if (
+        textful_segments <= 6
+        and alpha_word_count >= 16  # More than 15 words (catches repetition)
+        and len(unique_words) <= 6  # But very few unique word types
+        and contentful_word_count == 0  # No actual semantic content
+        and mean_logprob <= -0.50
     ):
         return True
 
