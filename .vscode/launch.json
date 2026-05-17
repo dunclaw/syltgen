@@ -7,8 +7,8 @@
             "request": "launch",
             "module": "syltgen.main",
             "args": [
-                "c:/Users/duncl/Music",
-                "e:/Temp/FullOutput",
+                "E:/Temp/Input",
+                "e:/Temp/Output",
                 "--verbose"
             ],
             "cwd": "${workspaceFolder}",

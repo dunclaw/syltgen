@@ -238,24 +238,26 @@ def process_song(
         # placement.
         unsynced = existing_unsynced if existing_unsynced is not None else read_uslt_lyrics(mp3_path)
 
-        # --- Step 1: stem separation into a temp directory ----------------------
-        with tempfile.TemporaryDirectory(prefix="syltgen_stems_") as tmp_stems:
-            vocals_path = separate_vocals(mp3_path, tmp_stems, model_name=sep_model)
-
-            if unsynced:
-                logger.info("Found USLT lyrics – using forced alignment on separated vocals.")
-                segments = transcribe_and_align(
-                    vocals_path,
-                    unsynced_lyrics=unsynced,
-                    model_name=whisper_model,
-                    device=device,
-                    compute_type=compute_type,
-                    language=language,
-                )
-            else:
-                logger.info("No USLT lyrics – using full transcription on separated vocals.")
-
-                # --- Step 2: transcription --------------------------------------
+        if unsynced:
+            # For forced alignment we already know the words — the model only needs to
+            # find *when* they occur.  Use the original MP3 directly: stem separation
+            # introduces bleed-through artifacts that can fool the aligner into
+            # anchoring the first lines to early spurious matches in the intro.
+            logger.info("Found USLT lyrics – using forced alignment on original audio.")
+            segments = transcribe_and_align(
+                mp3_path,
+                unsynced_lyrics=unsynced,
+                model_name=whisper_model,
+                device=device,
+                compute_type=compute_type,
+                language=language,
+            )
+        else:
+            # No lyrics — full transcription needs clean vocal stems so Whisper can
+            # hear words clearly without the backing track drowning them out.
+            logger.info("No USLT lyrics – using full transcription on separated vocals.")
+            with tempfile.TemporaryDirectory(prefix="syltgen_stems_") as tmp_stems:
+                vocals_path = separate_vocals(mp3_path, tmp_stems, model_name=sep_model)
                 segments = transcribe_and_align(
                     vocals_path,
                     unsynced_lyrics=None,

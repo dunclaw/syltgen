@@ -135,21 +135,93 @@ def transcribe_and_align(
     return segments
 
 
+_STABLE_TS_MODEL_CACHE: dict[tuple[str, str], object] = {}
+
+
+def _stable_ts_transcribe(
+    audio,
+    model_name: str,
+    device: str,
+    language: str,
+) -> list[dict]:
+    """Transcribe using stable-ts (regularized Whisper timestamps).
+
+    Returns segments in the same shape ``whisperx.align`` expects::
+
+        [{"text": ..., "start": ..., "end": ..., "words": [...]}]
+
+    stable-ts produces dramatically better segment timing than vanilla Whisper /
+    faster-whisper because it uses silence-suppression and per-token log-prob
+    regularization to keep words anchored to the audio they actually occurred in,
+    instead of letting Whisper relocate phrases across long silent gaps.
+    """
+    import stable_whisper
+
+    cache_key = (model_name, device)
+    model = _STABLE_TS_MODEL_CACHE.get(cache_key)
+    if model is None:
+        logger.info("Loading stable-ts model '%s' on %s…", model_name, device)
+        model = stable_whisper.load_model(model_name, device=device)
+        _STABLE_TS_MODEL_CACHE[cache_key] = model
+
+    # suppress_silence + vad pre-detection are the main features that fix the
+    # "Whisper guessed words then put them on the wrong audio" failure.
+    result = model.transcribe(
+        audio,
+        language=language,
+        vad=True,
+        suppress_silence=True,
+        word_timestamps=True,
+        verbose=None,
+    )
+
+    segments_out: list[dict] = []
+    for seg in result.segments:
+        words = []
+        for w in (seg.words or []):
+            if w.start is None or w.end is None:
+                continue
+            words.append({
+                "word": w.word.strip(),
+                "start": float(w.start),
+                "end": float(w.end),
+                "score": float(getattr(w, "probability", 1.0) or 1.0),
+            })
+        segments_out.append({
+            "text": seg.text.strip(),
+            "start": float(seg.start),
+            "end": float(seg.end),
+            "words": words,
+        })
+    return segments_out
+
+
 def _transcribe(whisperx, audio, model_name, device, compute_type, language):
-    """Run Whisper transcription then word-level alignment."""
-    model = whisperx.load_model(model_name, device, compute_type=compute_type, language=language)
-    result = model.transcribe(audio, batch_size=16)
-    segments = result["segments"]
+    """Run stable-ts transcription with regularized word-level timestamps."""
+    segments = _stable_ts_transcribe(audio, model_name, device, language)
 
     if _looks_probably_instrumental(segments):
         logger.info("No credible lyrics detected; treating track as instrumental.")
         return []
 
-    align_model, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
-    aligned = whisperx.align(segments, align_model, metadata, audio, device, return_char_alignments=False)
-
     # Post-process: produce consistent, phrase-like line lengths.
-    refined = _split_long_segments(aligned["segments"])
+    refined = _split_long_segments(segments)
+
+    # Apply vocal onset floor: if the audio-derived onset is detectably later
+    # than the first transcribed segment, clamp early segments forward.
+    if refined:
+        vocal_onset = _estimate_vocal_onset_from_audio(audio)
+        if vocal_onset is not None:
+            first_start = float(refined[0].get("start", 0.0))
+            offset = vocal_onset - first_start
+            if 5.0 < offset < 60.0:
+                logger.debug(
+                    "Onset floor %.2f s applied (first transcribed seg at %.2f s).",
+                    vocal_onset,
+                    first_start,
+                )
+                refined = _apply_intro_onset_floor(refined, vocal_onset)
+
     return refined
 
 
@@ -733,12 +805,22 @@ def _normalize_token(token: str) -> str:
     return re.sub(r"[^a-z']", "", token.lower().replace("\u2019", "'"))
 
 
-_MATCH_MIN_SCORE = 0.25  # Lines scoring below this are treated as unmatched
+_MATCH_MIN_SCORE = 0.30  # Lines scoring below this are treated as unmatched.
+# Tuning notes:
+#   - Too low (e.g. 0.20): garbage matches lock in, lines anchor to phantom
+#     pre-vocal Whisper words from stem-separator bleed-through.
+#   - Too high (e.g. 0.45): legitimate but imperfect matches (Whisper mis-hearing
+#     a few words) get rejected, and interpolation produces worse timing than
+#     the imperfect match would have.
+# 0.30 balances both.  The pre-onset word filter is the primary defense against
+# phantom matches, not this threshold.
 
 
 def _align_uslt_to_transcribed_words(
     uslt_lines: list[str],
     timed_words: list[dict],
+    *,
+    audio_onset: float | None = None,
 ) -> list[dict]:
     """Match USLT lyric lines to transcribed word timestamps.
 
@@ -816,9 +898,11 @@ def _align_uslt_to_transcribed_words(
                 matched_from_line = sum(sz for _, _, sz in sm.get_matching_blocks())
                 coverage = matched_from_line / n_line
                 score = ratio * max(0.5, coverage)
-                # Tiny penalty for skipping so we prefer the earliest good
-                # match when scores are otherwise equal.
-                score -= skip * 0.005
+                # Skip penalty: gently prefer earlier matches when quality is equal,
+                # but not so strongly that a weak early match beats a strong later one.
+                # 0.001 per word: at skip=100 the penalty is only 0.10, so a match
+                # scoring 0.72 early cannot beat a match scoring 0.85 at skip=100+.
+                score -= skip * 0.001
 
                 if score > best_score:
                     best_score = score
@@ -832,11 +916,31 @@ def _align_uslt_to_transcribed_words(
                 "end": float(timed_words[best_end_idx]["end"]),
                 "matched": True,
             })
+            matched_tokens = norm_trans[best_start_idx : best_end_idx + 1]
+            logger.debug(
+                "  [match  %.2f] @ %6.2fs  USLT=%-60r  TRANS=%r",
+                best_score,
+                float(timed_words[best_start_idx]["start"]),
+                " ".join(line_tokens),
+                " ".join(matched_tokens),
+            )
             word_cursor = min(best_end_idx + 1, n_words)
         else:
             # No confident match — freeze cursor so downstream lines can still
             # find their real words.
             anchors.append({"text": line, "start": -1.0, "end": -1.0, "matched": False})
+            # Show the best (rejected) candidate so we can see what Whisper heard.
+            if best_score > 0:
+                rejected_tokens = norm_trans[best_start_idx : best_end_idx + 1]
+                logger.debug(
+                    "  [NO-MATCH %.2f] best @ %6.2fs USLT=%-60r  TRANS=%r",
+                    best_score,
+                    float(timed_words[best_start_idx]["start"]),
+                    " ".join(line_tokens),
+                    " ".join(rejected_tokens),
+                )
+            else:
+                logger.debug("  [NO-MATCH ----] no candidates USLT=%r", " ".join(line_tokens))
 
     # ── Pass 2: interpolate timestamps for unmatched lines ──────────────────
     matched_pairs = [(i, a["start"]) for i, a in enumerate(anchors) if a["matched"]]
@@ -867,8 +971,20 @@ def _align_uslt_to_transcribed_words(
         if prev_match is None and next_match is None:
             anchor["start"] = float(timed_words[0]["start"])
         elif prev_match is None:
+            # Leading unmatched line(s) before the first anchored line.
+            # Use the audio-detected vocal onset as a synthetic anchor at index -1
+            # so we interpolate forward from the true vocal start instead of
+            # backing up linearly from the first matched line (which produces
+            # wildly wrong starts when the first matched line is many seconds
+            # into the song, e.g. line 3 anchored at 34s would push line 1 to ~31s
+            # via backward linear extrapolation).
             nj, nt = next_match  # type: ignore[misc]
-            anchor["start"] = max(0.0, nt - (nj - i) * 1.5)
+            if audio_onset is not None and audio_onset < nt:
+                # Interpolate between (i = -1, t = audio_onset) and (nj, nt).
+                frac = (i - (-1)) / max(1, nj - (-1))
+                anchor["start"] = audio_onset + frac * (nt - audio_onset)
+            else:
+                anchor["start"] = max(0.0, nt - (nj - i) * 1.5)
         elif next_match is None:
             pj, pt = prev_match  # type: ignore[misc]
             anchor["start"] = pt + (i - pj) * 2.0
@@ -981,6 +1097,98 @@ def _merge_tiny_neighbor_lines(segments: list[dict], *, min_words: int, max_word
     return cleaned
 
 
+def _vad_clip_pre_lyric_audio(audio, sr: int = 16000) -> tuple:
+    """Clip a short pre-lyric speech burst from the start of the audio.
+
+    Some tracks have garbled speech, DJ drops, or other voice-like content
+    before the actual song lyrics begin.  This fools the forced aligner into
+    anchoring the first lyric lines there instead of at the true vocal entry.
+
+    Strategy: run Silero VAD, detect the first contiguous speech cluster.
+    If that cluster is short (<10 s) AND followed by a long silence gap (>5 s
+    of near-zero VAD activity), it is almost certainly a pre-lyric artifact —
+    clip the audio so the aligner cannot match against it.
+
+    Returns ``(audio_slice, offset_seconds)``.  When no clip is needed,
+    ``offset_seconds`` is 0.0 and the original array is returned unchanged.
+    """
+    try:
+        import torch
+        from stable_whisper.stabilization.silero_vad import load_silero_vad_model, compute_vad_probs
+    except Exception:
+        return audio, 0.0
+
+    window = 512
+    vad_threshold = 0.4
+    silence_threshold = 0.1
+
+    try:
+        vad_model, _ = load_silero_vad_model(verbose=False)
+        import numpy as np
+        audio_tensor = torch.from_numpy(np.asarray(audio)).float()
+        probs = compute_vad_probs(vad_model, audio_tensor, sr, window, progress=False)
+    except Exception as exc:
+        logger.debug("VAD clip skipped: %s", exc)
+        return audio, 0.0
+
+    frame_dur = window / sr
+
+    # Find first speech frame.
+    first_speech = None
+    for i, p in enumerate(probs):
+        if p > vad_threshold:
+            first_speech = i
+            break
+
+    if first_speech is None:
+        return audio, 0.0
+
+    # Extend to find the end of the first speech cluster (allow gaps ≤ 10 frames ≈ 320 ms).
+    cluster_end = first_speech
+    silence_run = 0
+    for i in range(first_speech, len(probs)):
+        if probs[i] > vad_threshold:
+            cluster_end = i
+            silence_run = 0
+        else:
+            silence_run += 1
+            if silence_run >= 10:
+                break
+
+    cluster_start_s = first_speech * frame_dur
+    cluster_end_s = cluster_end * frame_dur
+    cluster_dur = cluster_end_s - cluster_start_s
+
+    # Count how long the silence after the cluster lasts (up to 20 s ahead).
+    silence_frames = 0
+    max_look = min(len(probs), cluster_end + int(20.0 / frame_dur))
+    for i in range(cluster_end + 1, max_look):
+        if probs[i] < silence_threshold:
+            silence_frames += 1
+        else:
+            break
+    silence_after_s = silence_frames * frame_dur
+
+    logger.debug(
+        "VAD pre-lyric check: cluster %.2f–%.2f s (%.1f s), silence after %.1f s",
+        cluster_start_s, cluster_end_s, cluster_dur, silence_after_s,
+    )
+
+    MAX_CLUSTER = 10.0   # s — clusters longer than this are likely the actual vocals
+    MIN_GAP = 5.0        # s — gap must be this long to confirm it's a pre-lyric burst
+
+    if cluster_dur <= MAX_CLUSTER and silence_after_s >= MIN_GAP:
+        clip_at_s = cluster_end_s + 1.0   # 1 s buffer after cluster ends
+        clip_sample = int(clip_at_s * sr)
+        logger.info(
+            "Clipping %.1f s of pre-lyric speech (%.2f–%.2f s) from audio before alignment.",
+            clip_at_s, cluster_start_s, cluster_end_s,
+        )
+        return audio[clip_sample:], clip_at_s
+
+    return audio, 0.0
+
+
 def _forced_align(
     whisperx,
     audio,
@@ -991,19 +1199,19 @@ def _forced_align(
     model_name: str,
     compute_type: str,
 ):
-    """Derive synchronized line timings from USLT lyrics + full transcription.
+    """Align USLT lyrics to audio using stable-ts forced alignment.
 
-    Strategy:
-    1. Transcribe the audio with Whisper to detect the true vocal content.
-    2. Run whisperx word-level alignment to get a per-word timestamp list.
-    3. Greedily match each USLT line to the closest consecutive word sequence
-       using fuzzy text scoring.
-    4. Assign each line the *start* timestamp of its first matched word.
+    Strategy: pass the exact USLT text to stable_whisper.align(), which performs
+    true forced alignment — it knows the words and only finds when they occur in
+    the audio.  This is far more accurate than transcription + fuzzy matching
+    because it does not invent words, cannot drift, and correctly handles
+    separator bleed-through (it ignores audio that doesn't match the text).
 
-    This completely avoids the progressive timing drift caused by coarse-segment
-    seeding, where accumulated stretch errors between musical gaps push later
-    lines progressively late.
+    ``original_split=True`` preserves the original line-break structure so each
+    output segment corresponds 1-to-1 with an input USLT line.
     """
+    import stable_whisper
+
     lines = [line.strip() for line in unsynced_lyrics.splitlines() if line.strip()]
     if not lines:
         logger.warning("No lyrics text provided for alignment.")
@@ -1012,42 +1220,135 @@ def _forced_align(
     audio_duration = len(audio) / 16000.0
     logger.debug("Audio duration: %.1f s, %d USLT lines", audio_duration, len(lines))
 
-    # Full Whisper transcription pass.
-    model = whisperx.load_model(model_name, device, compute_type=compute_type, language=language)
-    tx_result = model.transcribe(audio, batch_size=16)
-    raw_segments = tx_result.get("segments", [])
+    # Load (or reuse cached) model.
+    cache_key = (model_name, device)
+    model = _STABLE_TS_MODEL_CACHE.get(cache_key)
+    if model is None:
+        logger.info("Loading stable-ts model '%s' on %s…", model_name, device)
+        model = stable_whisper.load_model(model_name, device=device)
+        _STABLE_TS_MODEL_CACHE[cache_key] = model
+
+    # Join USLT lines with newlines so original_split=True produces one segment per line.
+    lyrics_text = "\n".join(lines)
+    logger.info("Running stable-ts forced alignment on %d lyric lines…", len(lines))
+
+    # Clip any pre-lyric speech burst to prevent the aligner from anchoring
+    # the first lyric lines to early voice-like artifacts in the intro.
+    audio_to_align, time_offset = _vad_clip_pre_lyric_audio(audio)
+
+    try:
+        result = stable_whisper.alignment.align(
+            model,
+            audio_to_align,
+            lyrics_text,
+            language=language,
+            original_split=True,
+            vad=True,
+            suppress_silence=True,
+            nonspeech_skip=None,  # Don't skip long gaps; last lines may follow an outro break
+            only_voice_freq=True, # Restrict to 200-5000 Hz to avoid false matches in instrumental sections
+            verbose=None,
+        )
+    except Exception as exc:
+        logger.warning("stable_whisper.align failed (%s); falling back to transcription.", exc)
+        return _forced_align_transcription_fallback(audio, lines, device, language, model_name)
+
+    if result is None or not result.segments:
+        logger.warning("stable_whisper.align returned no segments; falling back.")
+        return _forced_align_transcription_fallback(audio, lines, device, language, model_name)
+
+    # Convert WhisperResult segments → our standard list-of-dicts format.
+    # The number of segments should equal the number of lyric lines when
+    # original_split=True, but guard against count mismatch just in case.
+    segments_out: list[dict] = []
+    for seg in result.segments:
+        segments_out.append({
+            "text": seg.text.strip(),
+            "start": float(seg.start),
+            "end": float(seg.end),
+        })
+
+    logger.debug(
+        "stable-ts forced alignment produced %d segments for %d USLT lines.",
+        len(segments_out),
+        len(lines),
+    )
+
+    # If segment count matches line count exactly, restore the original USLT line
+    # text (forced alignment may slightly rephrase; we trust the source lyrics).
+    if len(segments_out) == len(lines):
+        for seg, line in zip(segments_out, lines):
+            seg["text"] = line
+    else:
+        logger.warning(
+            "Segment count mismatch: %d segments vs %d lyric lines; "
+            "using aligned text as-is.",
+            len(segments_out),
+            len(lines),
+        )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        for seg in segments_out[:15]:
+            logger.debug("  %6.2fs  %r", seg["start"], seg["text"])
+
+    # Add back the clip offset so timestamps are relative to the original audio.
+    if time_offset > 0.0:
+        for seg in segments_out:
+            seg["start"] += time_offset
+            seg["end"] += time_offset
+
+    return segments_out
+
+
+def _forced_align_transcription_fallback(audio, lines: list[str], device: str, language: str, model_name: str) -> list[dict]:
+    """Fallback: transcribe + fuzzy-match when forced alignment fails.
+
+    Uses the old stable-ts transcription path with greedy word matching.
+    """
+    raw_segments = _stable_ts_transcribe(audio, model_name, device, language)
 
     if _looks_probably_instrumental(raw_segments):
-        logger.info("Track appears instrumental; skipping USLT alignment.")
-        return []
+        logger.warning(
+            "Transcription is very sparse or instrumental; "
+            "assigning approximate timestamps to %d USLT lines.",
+            len(lines),
+        )
+        if raw_segments:
+            return _seed_segments_by_coarse_durations(lines, raw_segments)
+        total_dur = len(audio) / 16000.0
+        step = total_dur / max(1, len(lines))
+        return [
+            {"text": line, "start": i * step, "end": (i + 1) * step}
+            for i, line in enumerate(lines)
+        ]
 
-    # Word-level alignment to get per-word timestamps.
-    align_language = tx_result.get("language") or language
-    logger.debug("Running word-level alignment (lang=%s).", align_language)
-    align_model, metadata = whisperx.load_align_model(language_code=align_language, device=device)
-    aligned = whisperx.align(raw_segments, align_model, metadata, audio, device, return_char_alignments=False)
+    timed_words = _extract_all_timed_words(raw_segments)
+    audio_onset = _estimate_vocal_onset_from_audio(audio)
 
-    timed_words = _extract_all_timed_words(aligned["segments"])
-    logger.debug("Extracted %d timed words.", len(timed_words))
+    if audio_onset is not None and timed_words:
+        first_word_start = timed_words[0]["start"]
+        if audio_onset - first_word_start > 5.0:
+            cutoff = audio_onset - 3.0
+            kept = [w for w in timed_words if w["start"] >= cutoff]
+            if len(kept) >= 5:
+                logger.info(
+                    "Onset %.1fs: discarding %d pre-onset phantom words.",
+                    audio_onset, len(timed_words) - len(kept),
+                )
+                timed_words = kept
 
     if len(timed_words) >= 5:
-        result = _align_uslt_to_transcribed_words(lines, timed_words)
-        logger.debug("Matched %d USLT lines to word timestamps.", len(result))
-        return result
+        result = _align_uslt_to_transcribed_words(lines, timed_words, audio_onset=audio_onset)
+        if result:
+            floor = audio_onset if audio_onset is not None else timed_words[0]["start"]
+            return _apply_intro_onset_floor(result, floor)
 
-    # Sparse fallback: not enough word timestamps (very quiet / sparse vocal).
-    # Fall back to segment-level seeding + whisperx.align().
-    logger.warning(
-        "Only %d timed words extracted; falling back to segment-seeded alignment.",
-        len(timed_words),
-    )
-    coarse = aligned["segments"]
+    coarse = raw_segments
     segments = _seed_segments_from_coarse_alignment(lines, coarse)
     if len(segments) != len(lines):
         segments = _seed_segments_by_coarse_durations(lines, coarse)
     vocal_start = float(coarse[0]["start"]) if coarse else 0.0
-    fallback_aligned = whisperx.align(segments, align_model, metadata, audio, device, return_char_alignments=False)
-    return _apply_intro_onset_floor(fallback_aligned["segments"], vocal_start)
+    return _apply_intro_onset_floor(segments, vocal_start)
 
 
 def _apply_intro_onset_floor(segments: list[dict], vocal_start: float) -> list[dict]:

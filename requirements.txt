@@ -20,6 +20,9 @@ audio-separator[gpu]>=0.27.0
 # Requires Python >=3.10,<3.14
 whisperx>=3.1.0
 
+# Regularized Whisper timestamps (fixes "right words, wrong audio" failures)
+stable-ts>=2.19.0
+
 # Utilities
 tqdm>=4.66.0
 colorlog>=6.8.0
