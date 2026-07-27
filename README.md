@@ -74,6 +74,26 @@ If the source song has no SYLT and has a viable same-name input `.lrc`, `syltgen
 - Instrumental/classical genre-tagged files are skipped entirely
 - If no credible lyrics are detected, output artifacts are removed and file is skipped
 - Oversized cover art can be automatically normalized during rewrite flows
+- Both code paths run on separated vocal stems, and a forced alignment that
+  shows signs of having run out of lyric text is replaced by transcription-derived
+  timing (see *Accuracy benchmark*)
+
+## Accuracy Benchmark
+
+`tests/benchmark/` measures line placement against the SYLT tags already present
+in a library of MP3s. Files carrying both SYLT and a USLT sheet with the same
+line count give a 1-to-1 reference.
+
+```bash
+pytest tests/                                    # unit tests only (no audio needed)
+python -m tests.benchmark.run_bench index        # scan the library
+python -m tests.benchmark.run_bench run --limit 100 --variant mine
+python -m tests.benchmark.run_bench compare baseline mine
+```
+
+Point it at a different library with `--library` or `SYLTGEN_BENCH_LIBRARY`.
+Model output is cached per variant under `tests/benchmark/.cache/`, so
+re-scoring a finished run is instant.
 
 ## Debugging in VS Code
 

@@ -42,6 +42,19 @@ _LOW_CONTENT_WORDS = _WEAK_BOUNDARY_END | _WEAK_BOUNDARY_START | {
 DEFAULT_WHISPER_MODEL = "large-v2"
 DEFAULT_COMPUTE_TYPE = "float16"
 
+#: Keyword arguments passed to ``stable_whisper.alignment.align`` in the USLT
+#: forced-alignment path.  Exposed as a module constant so the accuracy
+#: benchmark (``tests/benchmark``) can sweep them without forking the pipeline.
+DEFAULT_ALIGN_OPTIONS: dict = {
+    "original_split": True,   # one output segment per USLT line
+    "vad": True,
+    "suppress_silence": True,
+    "nonspeech_skip": None,   # do not skip long gaps; outros can follow a break
+    "only_voice_freq": True,  # 200-5000 Hz, avoids matching instrumental content
+}
+
+
+
 
 def _default_device() -> str:
     """Return 'cuda' if a CUDA-capable GPU is available, otherwise 'cpu'."""
@@ -62,6 +75,8 @@ def transcribe_and_align(
     device: str = DEFAULT_DEVICE,
     compute_type: str = DEFAULT_COMPUTE_TYPE,
     language: str = "en",
+    align_options: Optional[dict] = None,
+    align_method: str = "auto",
 ) -> list[dict]:
     """
     Transcribe and/or align *audio_path* using WhisperX.
@@ -85,6 +100,17 @@ def transcribe_and_align(
         ``"int8"`` (fast, low VRAM) or ``"float16"`` (higher accuracy on GPU).
     language:
         ISO 639-1 language code for transcription (e.g. ``"en"``).
+    align_options:
+        Optional overrides merged over :data:`DEFAULT_ALIGN_OPTIONS` for the
+        forced-alignment path.  Used by the accuracy benchmark to sweep
+        alignment settings; production callers should leave this ``None``.
+    align_method:
+        Strategy for the USLT path.  ``"align"`` uses stable-ts forced
+        alignment only, ``"transcribe_match"`` transcribes the audio and maps
+        the lyric lines onto the transcript with a global token alignment,
+        ``"transcribe_greedy"`` uses the older per-line greedy matcher, and
+        ``"auto"`` (the default) runs forced alignment and falls back to
+        transcribe-and-match when the alignment looks broken.
 
     Returns
     -------
@@ -127,6 +153,8 @@ def transcribe_and_align(
             language,
             model_name=model_name,
             compute_type=compute_type,
+            align_options=align_options,
+            align_method=align_method,
         )
     else:
         logger.info("Full transcription mode (no lyrics provided).")
@@ -805,6 +833,143 @@ def _normalize_token(token: str) -> str:
     return re.sub(r"[^a-z']", "", token.lower().replace("\u2019", "'"))
 
 
+def _line_token_lists(lines: list[str]) -> list[list[str]]:
+    """Normalized word tokens for each lyric line."""
+    return [
+        [t for t in (_normalize_token(w) for w in re.findall(r"[A-Za-z']+", line)) if t]
+        for line in lines
+    ]
+
+
+def _interpolate_unanchored_lines(
+    anchors: list[dict],
+    timed_words: list[dict],
+    *,
+    audio_onset: float | None,
+) -> list[dict]:
+    """Fill in timing for lines that could not be anchored to a transcript word.
+
+    Unanchored lines are placed by linear interpolation between the nearest
+    anchored lines on either side, so a line the transcriber never heard still
+    lands between its neighbours instead of inheriting a neighbour's timestamp.
+    """
+    matched = [(i, a["start"]) for i, a in enumerate(anchors) if a["matched"]]
+
+    if not matched:
+        total = float(timed_words[-1]["end"]) if timed_words else 0.0
+        first = float(timed_words[0]["start"]) if timed_words else 0.0
+        span = max(0.0, total - first)
+        count = max(1, len(anchors))
+        for index, anchor in enumerate(anchors):
+            anchor["start"] = first + span * index / count
+            anchor["end"] = first + span * (index + 1) / count
+        return anchors
+
+    for index, anchor in enumerate(anchors):
+        if anchor["matched"]:
+            continue
+
+        previous = next(
+            ((j, t) for j, t in reversed(matched) if j < index), None
+        )
+        following = next(((j, t) for j, t in matched if j > index), None)
+
+        if previous is None and following is None:
+            anchor["start"] = float(timed_words[0]["start"]) if timed_words else 0.0
+        elif previous is None:
+            next_index, next_time = following  # type: ignore[misc]
+            if audio_onset is not None and audio_onset < next_time:
+                fraction = (index + 1) / max(1, next_index + 1)
+                anchor["start"] = audio_onset + fraction * (next_time - audio_onset)
+            else:
+                anchor["start"] = max(0.0, next_time - (next_index - index) * 1.5)
+        elif following is None:
+            prev_index, prev_time = previous
+            anchor["start"] = prev_time + (index - prev_index) * 2.0
+        else:
+            prev_index, prev_time = previous
+            next_index, next_time = following  # type: ignore[misc]
+            fraction = (index - prev_index) / max(1, next_index - prev_index)
+            anchor["start"] = prev_time + fraction * (next_time - prev_time)
+
+        anchor["end"] = anchor["start"] + 2.0
+
+    return anchors
+
+
+def _align_lines_by_global_token_match(
+    uslt_lines: list[str],
+    timed_words: list[dict],
+    *,
+    audio_onset: float | None = None,
+    stats: dict | None = None,
+) -> list[dict]:
+    """Map lyric lines onto transcript words with a single global alignment.
+
+    The whole lyric sheet and the whole transcript are treated as two token
+    streams and matched in one pass with :class:`difflib.SequenceMatcher`.
+    Because the matching blocks it returns are monotonically increasing, every
+    line is placed in order and a stretch of audio the lyric sheet does not
+    cover (an unlisted verse, a long ad-lib, a repeat the sheet writes once) is
+    simply skipped instead of dragging the remaining lines out of position.
+
+    This replaces a per-line greedy forward search, which could not recover
+    once a single line locked onto the wrong words.
+    """
+    if not timed_words or not uslt_lines:
+        return []
+
+    token_lists = _line_token_lists(uslt_lines)
+
+    ref_tokens: list[str] = []
+    ref_line_index: list[int] = []
+    for line_index, tokens in enumerate(token_lists):
+        for token in tokens:
+            ref_tokens.append(token)
+            ref_line_index.append(line_index)
+
+    if not ref_tokens:
+        return []
+
+    transcript_tokens = [_normalize_token(w["token"]) for w in timed_words]
+
+    matcher = difflib.SequenceMatcher(None, ref_tokens, transcript_tokens, autojunk=False)
+
+    starts: dict[int, float] = {}
+    ends: dict[int, float] = {}
+    for ref_i, trans_i, size in matcher.get_matching_blocks():
+        for offset in range(size):
+            line_index = ref_line_index[ref_i + offset]
+            word = timed_words[trans_i + offset]
+            starts.setdefault(line_index, float(word["start"]))
+            ends[line_index] = float(word["end"])
+
+    anchors = [
+        {
+            "text": line,
+            "start": starts.get(index, -1.0),
+            "end": ends.get(index, -1.0),
+            "matched": index in starts,
+        }
+        for index, line in enumerate(uslt_lines)
+    ]
+
+    matched_count = sum(1 for a in anchors if a["matched"])
+    if stats is not None:
+        stats["anchored_ratio"] = matched_count / len(anchors) if anchors else 0.0
+    logger.debug(
+        "Global token match anchored %d/%d lyric lines (%d transcript words).",
+        matched_count,
+        len(anchors),
+        len(timed_words),
+    )
+
+    anchors = _interpolate_unanchored_lines(
+        anchors, timed_words, audio_onset=audio_onset
+    )
+    return [{"text": a["text"], "start": a["start"], "end": a["end"]} for a in anchors]
+
+
 _MATCH_MIN_SCORE = 0.30  # Lines scoring below this are treated as unmatched.
 # Tuning notes:
 #   - Too low (e.g. 0.20): garbage matches lock in, lines anchor to phantom
@@ -1198,6 +1363,8 @@ def _forced_align(
     *,
     model_name: str,
     compute_type: str,
+    align_options: Optional[dict] = None,
+    align_method: str = "auto",
 ):
     """Align USLT lyrics to audio using stable-ts forced alignment.
 
@@ -1209,6 +1376,13 @@ def _forced_align(
 
     ``original_split=True`` preserves the original line-break structure so each
     output segment corresponds 1-to-1 with an input USLT line.
+
+    Forced alignment does, however, fail badly when the lyric text and the audio
+    disagree — abbreviated lyric sheets, missing verses, long instrumental
+    breaks, or lyrics for a different mix of the song.  In those cases it runs
+    out of text before it runs out of audio and crams every remaining line into
+    the first half of the track.  ``align_method="auto"`` detects that outcome
+    and re-derives the timing from a transcription instead.
     """
     import stable_whisper
 
@@ -1219,6 +1393,17 @@ def _forced_align(
 
     audio_duration = len(audio) / 16000.0
     logger.debug("Audio duration: %.1f s, %d USLT lines", audio_duration, len(lines))
+
+    if align_method in ("transcribe_match", "transcribe_greedy"):
+        logger.info("Using transcribe-and-match alignment (align_method=%s).", align_method)
+        return _forced_align_transcription_fallback(
+            audio,
+            lines,
+            device,
+            language,
+            model_name,
+            matcher="greedy" if align_method == "transcribe_greedy" else "global",
+        )
 
     # Load (or reuse cached) model.
     cache_key = (model_name, device)
@@ -1236,18 +1421,19 @@ def _forced_align(
     # the first lyric lines to early voice-like artifacts in the intro.
     audio_to_align, time_offset = _vad_clip_pre_lyric_audio(audio)
 
+    options = dict(DEFAULT_ALIGN_OPTIONS)
+    if align_options:
+        options.update(align_options)
+    logger.debug("Alignment options: %s", options)
+
     try:
         result = stable_whisper.alignment.align(
             model,
             audio_to_align,
             lyrics_text,
             language=language,
-            original_split=True,
-            vad=True,
-            suppress_silence=True,
-            nonspeech_skip=None,  # Don't skip long gaps; last lines may follow an outro break
-            only_voice_freq=True, # Restrict to 200-5000 Hz to avoid false matches in instrumental sections
             verbose=None,
+            **options,
         )
     except Exception as exc:
         logger.warning("stable_whisper.align failed (%s); falling back to transcription.", exc)
@@ -1297,14 +1483,248 @@ def _forced_align(
             seg["start"] += time_offset
             seg["end"] += time_offset
 
+    if align_method == "auto":
+        signals = _alignment_failure_signals(result, segments_out, audio)
+        if _looks_like_failed_alignment(signals):
+            logger.info(
+                "Forced alignment looks unreliable (%s); "
+                "re-deriving timing from a transcription.",
+                ", ".join(f"{k}={v:.2f}" for k, v in signals.items()),
+            )
+            fallback_stats: dict = {}
+            fallback = _forced_align_transcription_fallback(
+                audio, lines, device, language, model_name, stats=fallback_stats
+            )
+            segments_out = _choose_better_placement(
+                segments_out,
+                signals,
+                fallback,
+                fallback_stats,
+                audio_duration=len(audio) / 16000.0 if audio is not None else 0.0,
+            )
+        else:
+            logger.debug(
+                "Alignment quality signals: %s",
+                ", ".join(f"{k}={v:.2f}" for k, v in signals.items()),
+            )
+
     return segments_out
 
 
-def _forced_align_transcription_fallback(audio, lines: list[str], device: str, language: str, model_name: str) -> list[dict]:
-    """Fallback: transcribe + fuzzy-match when forced alignment fails.
+def _choose_better_placement(
+    aligned: list[dict],
+    aligned_signals: dict[str, float],
+    fallback: list[dict],
+    fallback_stats: dict[str, float],
+    *,
+    audio_duration: float,
+) -> list[dict]:
+    """Keep whichever of the two candidate placements looks less broken.
 
-    Uses the old stable-ts transcription path with greedy word matching.
+    The forced alignment is only discarded when the transcription-derived
+    result is demonstrably healthier.  Without this check a shaky alignment
+    could be replaced by an outright guess — which happens on songs Whisper
+    transcribes badly (overlapping duets, non-English lyrics), where the
+    transcript simply has nothing to anchor the lyric lines to.
     """
+    if not fallback:
+        logger.info("Transcription fallback produced nothing; keeping alignment.")
+        return aligned
+
+    anchored = float(fallback_stats.get("anchored_ratio", 0.0))
+    approximate = bool(fallback_stats.get("approximate", 1.0))
+
+    if approximate or anchored < _MIN_FALLBACK_ANCHORED_RATIO:
+        logger.info(
+            "Transcription fallback anchored only %.0f%% of lines; "
+            "keeping the forced alignment.",
+            anchored * 100.0,
+        )
+        return aligned
+
+    aligned_badness = _placement_badness(
+        aligned,
+        audio_duration,
+        unplaced_word_ratio=aligned_signals.get("unplaced_word_ratio", 0.0),
+    )
+    fallback_badness = _placement_badness(
+        fallback, audio_duration, unanchored_ratio=1.0 - anchored
+    )
+
+    if fallback_badness < aligned_badness:
+        logger.info(
+            "Using transcription-derived timing (badness %.2f vs %.2f, "
+            "%.0f%% of lines anchored).",
+            fallback_badness,
+            aligned_badness,
+            anchored * 100.0,
+        )
+        return fallback
+
+    logger.info(
+        "Transcription fallback scored no better (badness %.2f vs %.2f); "
+        "keeping the forced alignment.",
+        fallback_badness,
+        aligned_badness,
+    )
+    return aligned
+
+
+#: A word the aligner could not place at all gets (almost) zero duration.
+_ZERO_WORD_DURATION = 0.02
+
+#: Two consecutive lines starting this close together did not really get
+#: separate timing; the aligner emitted them at the same instant.
+_COLLAPSED_LINE_GAP = 0.05
+
+#: Fraction of unplaced words above which forced alignment is not trustworthy.
+_MAX_UNPLACED_WORD_RATIO = 0.10
+
+#: Fraction of collapsed lines above which forced alignment is not trustworthy.
+_MAX_COLLAPSED_LINE_RATIO = 0.10
+
+#: Fraction of the audio that may pass after the last aligned line before the
+#: result is judged to have run out of text early.  Songs legitimately end with
+#: an instrumental outro, so this is deliberately generous.
+_MAX_TAIL_FRACTION = 0.25
+
+
+def _alignment_failure_signals(result, segments: list[dict], audio) -> dict[str, float]:
+    """Reference-free indicators that forced alignment went wrong.
+
+    When the lyric sheet and the audio disagree, the aligner consumes all its
+    text too early: the leftover words get zero duration, consecutive lines
+    collapse onto the same timestamp, and the aligned lines stop well before
+    the end of the recording.  All three are observable without ground truth.
+    """
+    unplaced = 0
+    total_words = 0
+    for segment in getattr(result, "segments", []) or []:
+        for word in getattr(segment, "words", None) or []:
+            start = getattr(word, "start", None)
+            end = getattr(word, "end", None)
+            if start is None or end is None:
+                continue
+            total_words += 1
+            if float(end) - float(start) <= _ZERO_WORD_DURATION:
+                unplaced += 1
+
+    collapsed = sum(
+        1
+        for previous, current in zip(segments, segments[1:])
+        if current["start"] - previous["start"] <= _COLLAPSED_LINE_GAP
+    )
+
+    audio_duration = len(audio) / 16000.0 if audio is not None else 0.0
+    last_end = max((float(s["end"]) for s in segments), default=0.0)
+    tail_fraction = (
+        max(0.0, audio_duration - last_end) / audio_duration
+        if audio_duration > 0
+        else 0.0
+    )
+
+    return {
+        "unplaced_word_ratio": unplaced / total_words if total_words else 0.0,
+        "collapsed_line_ratio": collapsed / max(1, len(segments) - 1),
+        "tail_fraction": tail_fraction,
+    }
+
+
+def _looks_like_failed_alignment(signals: dict[str, float]) -> bool:
+    """Decide whether to discard a forced-alignment result.
+
+    A large unaligned tail on its own is not enough — plenty of songs end with
+    a long instrumental outro — so it only counts when the aligner also shows
+    signs of having run out of text (unplaced words or collapsed lines).
+    """
+    unplaced = signals.get("unplaced_word_ratio", 0.0)
+    collapsed = signals.get("collapsed_line_ratio", 0.0)
+    tail = signals.get("tail_fraction", 0.0)
+
+    if unplaced >= _MAX_UNPLACED_WORD_RATIO:
+        return True
+    if collapsed >= _MAX_COLLAPSED_LINE_RATIO:
+        return True
+    return tail >= _MAX_TAIL_FRACTION and (unplaced >= 0.03 or collapsed >= 0.03)
+
+
+#: A transcription-derived result whose lines mostly could not be matched to
+#: transcript words is guesswork; the forced alignment is preferred over it
+#: even when the alignment itself looked shaky.
+_MIN_FALLBACK_ANCHORED_RATIO = 0.55
+
+
+def _placement_badness(
+    segments: list[dict],
+    audio_duration: float,
+    *,
+    unplaced_word_ratio: float = 0.0,
+    unanchored_ratio: float = 0.0,
+) -> float:
+    """Reference-free penalty score for a set of line timings (lower is better).
+
+    Used to compare two candidate placements for the same song — a forced
+    alignment and a transcription-derived one — without ground truth.  Every
+    term measures a way a result can be self-evidently wrong: lines stacked on
+    the same instant, lines running backwards, timing that stops long before
+    the audio does, or words/lines that were never really placed at all.
+    """
+    if not segments:
+        return float("inf")
+
+    pairs = list(zip(segments, segments[1:]))
+    divisor = max(1, len(pairs))
+    collapsed = sum(
+        1 for a, b in pairs if float(b["start"]) - float(a["start"]) <= _COLLAPSED_LINE_GAP
+    ) / divisor
+    backwards = sum(
+        1 for a, b in pairs if float(b["start"]) < float(a["start"]) - 1e-6
+    ) / divisor
+
+    last_end = max((float(s["end"]) for s in segments), default=0.0)
+    tail = (
+        max(0.0, audio_duration - last_end) / audio_duration
+        if audio_duration > 0
+        else 0.0
+    )
+    excess_tail = max(0.0, tail - _MAX_TAIL_FRACTION) / (1.0 - _MAX_TAIL_FRACTION)
+
+    return (
+        3.0 * collapsed
+        + 3.0 * backwards
+        + 2.0 * unplaced_word_ratio
+        + 2.0 * unanchored_ratio
+        + 1.0 * excess_tail
+    )
+
+
+def _forced_align_transcription_fallback(
+    audio,
+    lines: list[str],
+    device: str,
+    language: str,
+    model_name: str,
+    *,
+    matcher: str = "global",
+    stats: dict | None = None,
+) -> list[dict]:
+    """Derive line timing by transcribing the audio and matching the lyric text.
+
+    Used when forced alignment is unavailable or produced a broken result.
+    Transcription word timings are independent of the lyric sheet, so sections
+    the sheet does not cover cannot push the remaining lines off position.
+
+    ``matcher`` selects the line-to-transcript mapping: ``"global"`` runs a
+    single global token alignment, ``"greedy"`` keeps the older per-line
+    forward search (retained for benchmarking).
+
+    ``stats``, when given, is filled with reference-free quality indicators for
+    the result so the caller can decide whether to trust it.
+    """
+    if stats is not None:
+        stats.setdefault("anchored_ratio", 0.0)
+        stats.setdefault("approximate", 1.0)
+
     raw_segments = _stable_ts_transcribe(audio, model_name, device, language)
 
     if _looks_probably_instrumental(raw_segments):
@@ -1338,8 +1758,17 @@ def _forced_align_transcription_fallback(audio, lines: list[str], device: str, l
                 timed_words = kept
 
     if len(timed_words) >= 5:
-        result = _align_uslt_to_transcribed_words(lines, timed_words, audio_onset=audio_onset)
+        if matcher == "greedy":
+            result = _align_uslt_to_transcribed_words(
+                lines, timed_words, audio_onset=audio_onset
+            )
+        else:
+            result = _align_lines_by_global_token_match(
+                lines, timed_words, audio_onset=audio_onset, stats=stats
+            )
         if result:
+            if stats is not None:
+                stats["approximate"] = 0.0
             floor = audio_onset if audio_onset is not None else timed_words[0]["start"]
             return _apply_intro_onset_floor(result, floor)
 
