@@ -15,21 +15,63 @@ logger = logging.getLogger(__name__)
 # are quieter and do not emit repeated HTTPS connection debug lines.
 os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "0")
 
+# Words that almost never end a natural lyric line: they syntactically require a
+# following word (determiners, prepositions, conjunctions, copulas, auxiliaries,
+# modals).  Breaking after one of these produces the "dangling" line breaks that
+# read unnaturally, e.g. "the feeling is / lightning" or "you and / I".
 _WEAK_BOUNDARY_END = {
-    "a", "an", "the", "and", "or", "but", "to", "of", "in", "on", "at", "for", "with", "from", "by",
-    "as", "if", "that", "which", "who", "when", "while", "because", "cause", "my", "your", "our", "their",
-    "his", "her", "its", "i",
+    # determiners / possessives
+    "a", "an", "the", "my", "your", "our", "their", "his", "her", "its",
+    "every", "each", "another",
+    # conjunctions
+    "and", "or", "but", "nor", "as", "if", "that", "which", "who", "when",
+    "while", "because", "cause", "than",
+    # prepositions
+    "to", "of", "in", "on", "at", "for", "with", "from", "by", "into", "onto",
+    "upon", "without", "within",
+    # copulas / auxiliaries / modals
+    "am", "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "have", "has", "had", "having",
+    "will", "would", "shall", "should", "can", "could", "may", "might", "must",
+    "gonna", "wanna", "gotta",
+    # contracted subject+auxiliary forms, which always demand a continuation
+    "i'm", "you're", "we're", "they're", "he's", "she's", "it's", "that's",
+    "there's", "who's", "what's", "i've", "you've", "we've", "they've",
+    "i'll", "you'll", "we'll", "he'll", "she'll", "it'll", "they'll",
+    "i'd", "you'd", "we'd", "he'd", "she'd", "they'd",
+    "don't", "doesn't", "didn't", "won't", "can't", "cannot", "couldn't",
+    "wouldn't", "shouldn't", "isn't", "aren't", "wasn't", "weren't",
+    "haven't", "hasn't", "hadn't", "ain't",
+    # the pronoun "I" only ever dangles at line end
+    "i",
 }
+
+# Words that are weaker signals: they can legitimately end a line but usually
+# do not, so they get a smaller penalty.
+_MILD_BOUNDARY_END = {
+    "about", "over", "under", "through", "across", "around", "against",
+    "this", "these", "those", "some", "any", "no",
+}
+
 _WEAK_BOUNDARY_START = {
     "and", "or", "but", "to", "of", "in", "on", "at", "for", "with", "from", "by", "as", "if", "that",
     "which", "who", "when", "while", "because", "cause",
 }
 
+# Pronoun forms of "I" are always capitalised in English, so an uppercase next
+# token is not evidence of a sentence boundary for them.
+_ALWAYS_CAPITALIZED = {"i", "i'm", "i'll", "i've", "i'd"}
+
 _LIKELY_FILLER_WORDS = {
     "uh", "um", "oh", "ah", "ooh", "aah", "la", "na", "da", "so", "yo", "hey", "yeah",
 }
 
-_LOW_CONTENT_WORDS = _WEAK_BOUNDARY_END | _WEAK_BOUNDARY_START | {
+# Kept as an explicit set so that tuning the line-break vocabularies above does
+# not change instrumental / low-content detection.
+_LOW_CONTENT_WORDS = {
+    "a", "an", "the", "and", "or", "but", "to", "of", "in", "on", "at", "for", "with", "from", "by",
+    "as", "if", "that", "which", "who", "when", "while", "because", "cause", "my", "your", "our", "their",
+    "his", "her", "its", "i",
     "am", "is", "are", "was", "were", "be", "been", "being",
     "do", "does", "did", "have", "has", "had",
     "he", "she", "we", "they", "me", "him", "them", "you",
@@ -467,6 +509,9 @@ def _split_long_segments(
     pauses/punctuation while keeping line lengths reasonably uniform.
     """
     result: list[dict] = []
+    segments = _repair_dangling_segment_breaks(
+        segments, max_words=max_words, max_merge_gap=2.0
+    )
     for seg in segments:
         text = seg.get("text", "").strip()
         if not text:
@@ -490,6 +535,79 @@ def _split_long_segments(
     return _merge_tiny_neighbor_lines(result, min_words=min_words, max_words=max_words)
 
 
+def _repair_dangling_segment_breaks(
+    segments: list[dict],
+    *,
+    max_words: int,
+    max_merge_gap: float,
+    max_span_slack: int = 14,
+    max_passes: int = 3,
+) -> list[dict]:
+    """Merge segment boundaries that fall after a syntactically dangling word.
+
+    Whisper's own segment boundaries are the dominant source of line breaks -
+    the median segment is only a handful of words, so the consistency splitter
+    almost never runs.  When a segment ends on a word that demands a
+    continuation ("...the feeling is" / "...you and"), merge it with the
+    following segment.  The merged run is then re-split downstream, which lets
+    the boundary land somewhere the grammar actually allows.
+    """
+    if len(segments) < 2:
+        return list(segments)
+
+    limit = max_words + max_span_slack
+    for _ in range(max_passes):
+        merged_any = False
+        out: list[dict] = []
+        index = 0
+        while index < len(segments):
+            seg = segments[index]
+            nxt = segments[index + 1] if index + 1 < len(segments) else None
+            if nxt is not None and _ends_on_dangling_word(seg):
+                seg_words = _extract_timed_words(seg)
+                next_words = _extract_timed_words(nxt)
+                total = len(seg_words) + len(next_words)
+                gap = float(nxt["start"]) - float(seg["end"])
+                can_resplit = bool(seg_words and next_words)
+                budget = limit if can_resplit else max_words
+                if 0 < total <= budget and gap <= max_merge_gap:
+                    out.append(_merge_two_segments(seg, nxt, seg_words + next_words))
+                    merged_any = True
+                    index += 2
+                    continue
+            out.append(seg)
+            index += 1
+        segments = out
+        if not merged_any:
+            break
+
+    return segments
+
+
+def _ends_on_dangling_word(seg: dict) -> bool:
+    """True when the segment's final word cannot legitimately end a line."""
+    text = (seg.get("text") or "").strip()
+    if not text:
+        return False
+    last = text.split()[-1]
+    # Explicit end-of-sentence punctuation overrides the vocabulary check.
+    if re.search(r"[.!?]$", last):
+        return False
+    return _clean_boundary_word(last) in _WEAK_BOUNDARY_END
+
+
+def _merge_two_segments(first: dict, second: dict, words: list[dict]) -> dict:
+    merged_text = f"{(first.get('text') or '').strip()} {(second.get('text') or '').strip()}".strip()
+    return {
+        "text": merged_text,
+        "start": float(first["start"]),
+        "end": float(second["end"]),
+        "words": [
+            {"word": w["token"], "start": w["start"], "end": w["end"]} for w in words
+        ],
+    }
+
+
 def _split_segment_consistently(
     seg: dict,
     *,
@@ -506,6 +624,26 @@ def _split_segment_consistently(
 
     n = len(timed_words)
     boundary_bonus = [0.0] * n
+
+    # Whisper often emits long unpunctuated runs for dense/fast vocals.  In that
+    # case no gap ever reaches the absolute ``pause_threshold`` and every
+    # candidate boundary scores zero, so the length term alone decides the split
+    # and lines degenerate into fixed-width chunks.  Scale the threshold to the
+    # segment's own gap distribution so relative pauses still register, but never
+    # loosen it beyond the absolute threshold.
+    gaps = [
+        max(0.0, timed_words[k + 1]["start"] - timed_words[k]["end"])
+        for k in range(n - 1)
+    ]
+    positive_gaps = sorted(g for g in gaps if g > 0.01)
+    if positive_gaps:
+        median_gap = positive_gaps[len(positive_gaps) // 2]
+    else:
+        median_gap = 0.0
+    effective_pause = max(0.10, min(pause_threshold, median_gap * 2.5))
+
+    has_punctuation = any(re.search(r"[.!?,;:]$", w["token"]) for w in timed_words)
+
     for idx, word in enumerate(timed_words):
         next_word = timed_words[idx + 1] if idx + 1 < n else None
         gap_to_next = 0.0
@@ -520,7 +658,11 @@ def _split_segment_consistently(
 
         is_sentence_punct = bool(re.search(r"[.!?]$", token))
         is_soft_punct = bool(re.search(r"[,;:]$", token))
-        next_is_upper = bool(next_word is not None and re.match(r"[A-Z]", next_token))
+        next_is_upper = bool(
+            next_word is not None
+            and re.match(r"[A-Z]", next_token)
+            and start_word not in _ALWAYS_CAPITALIZED
+        )
         next_is_lower = bool(next_word is not None and re.match(r"[a-z]", next_token))
 
         if is_sentence_punct:
@@ -528,8 +670,23 @@ def _split_segment_consistently(
         elif is_soft_punct:
             bonus += 1.2
 
-        if gap_to_next >= pause_threshold:
-            bonus += min(3.6, gap_to_next * 6.5)
+        weak_end = end_word in _WEAK_BOUNDARY_END
+        mild_end = end_word in _MILD_BOUNDARY_END
+
+        if gap_to_next >= effective_pause:
+            # Reward proportionally to how much the gap stands out locally, so a
+            # modest but clearly-above-average pause in a dense passage still
+            # counts as a phrase boundary.
+            ratio = gap_to_next / effective_pause
+            pause_bonus = min(3.6, 1.0 + (ratio - 1.0) * 1.6)
+            # A pause after a word that syntactically demands a continuation is
+            # a held note or a breath, not a phrase boundary -- singers stretch
+            # "and", "is", "my" all the time.  Don't let it license a break.
+            if weak_end and not is_sentence_punct and not is_soft_punct:
+                pause_bonus *= 0.3
+            elif mild_end and not is_sentence_punct and not is_soft_punct:
+                pause_bonus *= 0.7
+            bonus += pause_bonus
         elif gap_to_next < 0.08:
             bonus -= 0.7
 
@@ -538,11 +695,13 @@ def _split_segment_consistently(
 
         # Very important: avoid splitting inside a flowing phrase when the next
         # token starts lowercase and there is no real pause/punctuation boundary.
-        if next_is_lower and not is_sentence_punct and not is_soft_punct and gap_to_next < (pause_threshold * 0.7):
+        if next_is_lower and not is_sentence_punct and not is_soft_punct and gap_to_next < (effective_pause * 0.7):
             bonus -= 2.8
 
-        if end_word in _WEAK_BOUNDARY_END:
-            bonus -= 3.0
+        if weak_end:
+            bonus -= 6.0
+        elif mild_end:
+            bonus -= 1.8
         if start_word in _WEAK_BOUNDARY_START:
             bonus -= 1.6
 
@@ -553,6 +712,10 @@ def _split_segment_consistently(
     dp = [inf] * (n + 1)
     nxt = [-1] * (n + 1)
     dp[n] = 0.0
+
+    # Without punctuation the syntactic/pause cues are the only real evidence we
+    # have, so let uniform line length matter less and avoid fixed-width chunking.
+    length_weight = 0.22 if has_punctuation else 0.13
 
     for i in range(n - 1, -1, -1):
         best_cost = inf
@@ -566,7 +729,7 @@ def _split_segment_consistently(
 
             cost = 0.0
             # Keep lengths somewhat consistent, but do not dominate pause/grammar cues.
-            cost += 0.22 * ((count - target_words) ** 2)
+            cost += length_weight * ((count - target_words) ** 2)
             if count < min_words:
                 cost += (min_words - count) * 4.0
             if count > max_words:

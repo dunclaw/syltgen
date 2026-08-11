@@ -112,6 +112,69 @@ def run_transcribe_path(mp3_path: Path, config: RunConfig) -> list[dict]:
         )
 
 
+def raw_transcript(mp3_path: Path, config: RunConfig) -> list[dict]:
+    """Whisper segments *before* line splitting, including word timings.
+
+    Caching this separately is what makes line-break tuning practical: the
+    expensive part (separation + transcription) is identical for every splitter
+    variant, so it is paid once and every later experiment is pure CPU.
+    """
+    from syltgen.separator import separate_vocals
+    from syltgen.transcriber import _stable_ts_transcribe
+
+    import whisperx
+
+    with tempfile.TemporaryDirectory(prefix="syltgen_bench_stems_") as stems_dir:
+        vocals_path = separate_vocals(mp3_path, stems_dir, model_name=config.sep_model)
+        audio = whisperx.load_audio(str(vocals_path))
+        return _stable_ts_transcribe(
+            audio, config.whisper_model, _resolve_device(config.device), config.language
+        )
+
+
+def _resolve_device(device: str) -> str:
+    if device != "auto":
+        return device
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def raw_transcript_cached(
+    mp3_path: Path,
+    config: RunConfig,
+    *,
+    cache_dir: Path,
+    refresh: bool = False,
+) -> dict:
+    """Cached :func:`raw_transcript`, in the same record shape as `run_path`."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached_path = _cache_file(cache_dir, mp3_path, "raw", "transcript")
+    if cached_path.exists() and not refresh:
+        try:
+            return json.loads(cached_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("Ignoring unreadable cache entry '%s'.", cached_path.name)
+
+    started = time.perf_counter()
+    try:
+        record = {
+            "path": str(mp3_path),
+            "segments": raw_transcript(mp3_path, config),
+            "error": None,
+        }
+    except Exception as exc:  # noqa: BLE001 - benchmark must survive bad files
+        logger.exception("Raw transcription failed for '%s'.", mp3_path.name)
+        record = {"path": str(mp3_path), "segments": [], "error": f"{type(exc).__name__}: {exc}"}
+
+    record["elapsed"] = time.perf_counter() - started
+    cached_path.write_text(json.dumps(record), encoding="utf-8")
+    return record
+
+
 _RUNNERS = {
     PATH_USLT: run_uslt_path,
     PATH_USLT_STEMS: run_uslt_stems_path,

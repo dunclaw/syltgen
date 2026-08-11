@@ -297,6 +297,117 @@ def cmd_compare(args: argparse.Namespace) -> int:
         print(report.compare(base_summary, cand_summary, COMPARE_KEYS))
     return 0
 
+def cmd_linebreaks(args: argparse.Namespace) -> int:
+    """Cache raw transcripts, split them, and score the resulting line breaks.
+
+    Transcription output is cached before splitting, so repeated invocations
+    while tuning the splitter cost seconds rather than hours.
+    """
+    from statistics import mean
+
+    from syltgen.tagger import read_uslt_lyrics
+    from syltgen.transcriber import _split_long_segments
+    from tests.benchmark import linebreaks as lb
+    from tests.benchmark.runner import raw_transcript_cached
+
+    if args.files:
+        selected = [Path(p) for p in args.files]
+    else:
+        selected = [
+            Path(item.path)
+            for item in sample(
+                load_or_scan_index(args.library),
+                limit=args.limit,
+                min_lines=args.min_lines,
+            )
+        ]
+
+    config = RunConfig(
+        whisper_model=args.whisper_model,
+        device=args.device,
+        compute_type=args.compute_type,
+        language=args.language,
+        sep_model=args.sep_model,
+    )
+
+    rows: list[dict] = []
+    for index, mp3_path in enumerate(selected, start=1):
+        logger.info("[%d/%d] %s", index, len(selected), mp3_path.name)
+        record = raw_transcript_cached(
+            mp3_path, config, cache_dir=args.cache_dir, refresh=args.refresh
+        )
+        if record.get("error") or not record["segments"]:
+            continue
+
+        hypothesis = lb.segments_to_lines(_split_long_segments(record["segments"]))
+        row: dict = {"path": str(mp3_path), "n_lines": len(hypothesis)}
+
+        dangling = lb.score_dangling_breaks(hypothesis)
+        row["dangling_rate"] = dangling.dangling_rate
+        row["n_breaks"] = dangling.n_breaks
+        row["n_dangling"] = dangling.n_dangling
+        row["examples"] = dangling.examples
+
+        reference = lb.uslt_lines(read_uslt_lyrics(mp3_path))
+        if reference:
+            breaks = lb.score_break_positions(
+                reference, hypothesis, tolerance=args.tolerance
+            )
+            row["break_f1"] = breaks.f1
+            row["break_precision"] = breaks.precision
+            row["break_recall"] = breaks.recall
+            row["coverage"] = breaks.coverage
+            row["reference_dangling_rate"] = lb.score_dangling_breaks(
+                reference
+            ).dangling_rate
+        rows.append(row)
+
+    if not rows:
+        logger.error("No files produced a transcript.")
+        return 1
+
+    args.results_dir.mkdir(parents=True, exist_ok=True)
+    out_path = _results_path(args.results_dir, f"lb_{args.variant}")
+    out_path.write_text(json.dumps(rows, indent=1), encoding="utf-8")
+
+    total_breaks = sum(r["n_breaks"] for r in rows)
+    total_dangling = sum(r["n_dangling"] for r in rows)
+    scored = [r for r in rows if "break_f1" in r]
+
+    print()
+    print(f"-- line breaks: {args.variant} ({len(rows)} files) " + "-" * 20)
+    print(f"  files                          {len(rows):>10}")
+    print(f"  lines produced                 {sum(r['n_lines'] for r in rows):>10}")
+    print(
+        f"  dangling break rate            "
+        f"{total_dangling / max(1, total_breaks):>10.4f}  "
+        f"({total_dangling}/{total_breaks})"
+    )
+    if scored:
+        print(f"  break F1 vs human lines        {mean(r['break_f1'] for r in scored):>10.4f}")
+        print(f"  break precision                {mean(r['break_precision'] for r in scored):>10.4f}")
+        print(f"  break recall                   {mean(r['break_recall'] for r in scored):>10.4f}")
+        print(f"  token coverage                 {mean(r['coverage'] for r in scored):>10.4f}")
+        print(
+            f"  (human lyric sheets score      "
+            f"{mean(r['reference_dangling_rate'] for r in scored):>10.4f} dangling)"
+        )
+
+    worst = sorted(rows, key=lambda r: -r["dangling_rate"])[: args.worst]
+    print()
+    print("  worst files by dangling break rate:")
+    for row in worst:
+        if not row["n_dangling"]:
+            continue
+        print(
+            f"   {row['dangling_rate']:6.1%} ({row['n_dangling']}/{row['n_breaks']})  "
+            f"{Path(row['path']).name[:52]}"
+        )
+        for example in row["examples"][:2]:
+            print(f"        {example}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bench", description=__doc__)
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -362,6 +473,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compare across code paths: the candidate code path to remap.",
     )
     compare_cmd.set_defaults(func=cmd_compare)
+
+    lb_cmd = sub.add_parser(
+        "linebreaks", help="Score line-break quality of the transcription path."
+    )
+    lb_cmd.add_argument("--limit", type=int, default=60)
+    lb_cmd.add_argument("--min-lines", type=int, default=8)
+    lb_cmd.add_argument("--variant", default="baseline")
+    lb_cmd.add_argument(
+        "--files", nargs="*", help="Explicit MP3 paths instead of a library sample."
+    )
+    lb_cmd.add_argument(
+        "--tolerance",
+        type=int,
+        default=0,
+        help="Tokens a break may be off by and still count as correct.",
+    )
+    lb_cmd.add_argument("--worst", type=int, default=10)
+    lb_cmd.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    lb_cmd.add_argument("--refresh", action="store_true")
+    lb_cmd.add_argument("--whisper-model", default="large-v2")
+    lb_cmd.add_argument("--device", default="auto")
+    lb_cmd.add_argument("--compute-type", default="float16")
+    lb_cmd.add_argument("--language", default="en")
+    lb_cmd.add_argument("--sep-model", default="UVR-MDX-NET-Voc_FT.onnx")
+    lb_cmd.set_defaults(func=cmd_linebreaks)
 
     return parser
 

@@ -11,6 +11,7 @@ from syltgen.transcriber import (
     _choose_better_placement,
     _looks_like_failed_alignment,
     _placement_badness,
+    _split_long_segments,
 )
 
 
@@ -278,3 +279,141 @@ def test_global_match_reports_anchored_ratio():
         stats=stats,
     )
     assert stats["anchored_ratio"] == pytest.approx(0.5)
+
+
+# --- line splitting -------------------------------------------------------
+
+
+def _segment(text: str, *, word_dur: float = 0.32, gap: float = 0.05,
+             pauses: dict[int, float] | None = None) -> dict:
+    """Build a dense segment with uniform word timings plus explicit pauses.
+
+    ``pauses`` maps a word index to the silence that follows it, which is how
+    the real transcriber sees a breath or a held note mid-phrase.
+    """
+    tokens = text.split()
+    pauses = pauses or {}
+    words = []
+    t = 0.0
+    for idx, token in enumerate(tokens):
+        words.append({"word": token, "start": t, "end": t + word_dur})
+        t += word_dur + pauses.get(idx, gap)
+    return {
+        "text": text,
+        "start": words[0]["start"],
+        "end": words[-1]["end"],
+        "words": words,
+    }
+
+
+def _pause_before(text: str, word: str, seconds: float = 0.5) -> dict[int, float]:
+    """Silence immediately before ``word`` -- i.e. after the token preceding it."""
+    tokens = [t.strip(".,;:!?").lower() for t in text.split()]
+    return {tokens.index(word.lower()) - 1: seconds}
+
+
+def _split_texts(text: str, **kwargs) -> list[str]:
+    return [s["text"] for s in _split_long_segments([_segment(text, **kwargs)])]
+
+
+def _break_pairs(lines: list[str]) -> set[tuple[str, str]]:
+    """(last word of a line, first word of the next) for every break."""
+    pairs = set()
+    for prev, nxt in zip(lines, lines[1:]):
+        prev_words = prev.split()
+        next_words = nxt.split()
+        if prev_words and next_words:
+            pairs.add((prev_words[-1].strip(".,;:!?").lower(), next_words[0].strip(".,;:!?").lower()))
+    return pairs
+
+
+def test_does_not_break_after_a_copula():
+    text = (
+        "Not a cloud in the sky but the feeling is lightning "
+        "Didn't know heaven was a place just like this"
+    )
+    lines = _split_texts(text, pauses=_pause_before(text, "lightning"))
+    assert ("is", "lightning") not in _break_pairs(lines)
+
+
+def test_does_not_break_after_a_possessive_determiner():
+    text = (
+        "It's all right here in front of my eyes "
+        "I think I found my happy place and I am never leaving"
+    )
+    lines = _split_texts(text, pauses=_pause_before(text, "eyes"))
+    assert ("my", "eyes") not in _break_pairs(lines)
+
+
+def test_does_not_break_before_the_pronoun_i():
+    text = (
+        "And oh, there was a time when you and I were standing "
+        "on the edge of a mountain, looking down at everything below"
+    )
+    lines = _split_texts(text, pauses=_pause_before(text, "I", 0.45))
+    assert ("and", "i") not in _break_pairs(lines)
+
+
+def test_unpunctuated_dense_text_is_not_chunked_at_fixed_width():
+    text = (
+        "Not a cloud in the sky but the feeling is lightning "
+        "Didn't know heaven was a place just like this "
+        "Every colour brighter than the one before it "
+        "Holding on to something that I never want to miss"
+    )
+    counts = [len(line.split()) for line in _split_texts(text)]
+    assert len(set(counts)) > 1, f"degenerate fixed-width split: {counts}"
+
+
+def test_split_preserves_every_word_in_order():
+    text = (
+        "Not a cloud in the sky but the feeling is lightning "
+        "Didn't know heaven was a place just like this"
+    )
+    joined = " ".join(_split_texts(text))
+    assert joined.split() == text.split()
+
+
+def test_short_segments_are_left_alone():
+    seg = _segment("Just a short line here")
+    assert [s["text"] for s in _split_long_segments([seg])] == ["Just a short line here"]
+
+
+
+
+def _after(previous: dict, text: str, *, gap: float = 0.4, **kwargs) -> dict:
+    """A segment starting ``gap`` seconds after ``previous`` ends."""
+    seg = _segment(text, **kwargs)
+    shift = float(previous["end"]) + gap - float(seg["start"])
+    for word in seg["words"]:
+        word["start"] += shift
+        word["end"] += shift
+    seg["start"] += shift
+    seg["end"] += shift
+    return seg
+
+
+def test_repairs_a_dangling_break_between_whisper_segments():
+    """Whisper's own boundaries are the main source of unnatural breaks."""
+    first = _segment("Not a cloud in the sky but the feeling is")
+    second = _after(first, "lightning didn't know heaven was a place")
+
+    lines = [s["text"] for s in _split_long_segments([first, second])]
+    assert ("is", "lightning") not in _break_pairs(lines)
+    assert " ".join(lines).split() == (first["text"] + " " + second["text"]).split()
+
+
+def test_does_not_merge_across_a_long_instrumental_gap():
+    first = _segment("Every night I dream about the")
+    second = _after(first, "morning light that never comes to me", gap=30.0)
+
+    lines = _split_long_segments([first, second])
+    assert len(lines) == 2
+
+
+def test_repair_leaves_well_formed_segments_alone():
+    first = _segment("Hello darkness my old friend")
+    second = _after(first, "I've come to talk with you again")
+
+    lines = [s["text"] for s in _split_long_segments([first, second])]
+    assert lines == [first["text"], second["text"]]
