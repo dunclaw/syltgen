@@ -74,6 +74,37 @@ If the source song has no SYLT and has a viable same-name input `.lrc`, `syltgen
 - Instrumental/classical genre-tagged files are skipped entirely
 - If no credible lyrics are detected, output artifacts are removed and file is skipped
 - Oversized cover art can be automatically normalized during rewrite flows
+- Both code paths run on separated vocal stems, and a forced alignment that
+  shows signs of having run out of lyric text is replaced by transcription-derived
+  timing (see *Accuracy benchmark*)
+- When transcribing without a lyric sheet, line breaks are repaired so they do not
+  fall after a word that requires a continuation; adjacent lines are merged and
+  re-split at a boundary the grammar allows
+
+## Accuracy Benchmark
+
+`tests/benchmark/` measures line placement against the SYLT tags already present
+in a library of MP3s. Files carrying both SYLT and a USLT sheet with the same
+line count give a 1-to-1 reference.
+
+```bash
+pytest tests/                                    # unit tests only (no audio needed)
+python -m tests.benchmark.run_bench index        # scan the library
+python -m tests.benchmark.run_bench run --limit 100 --variant mine
+python -m tests.benchmark.run_bench compare baseline mine
+python -m tests.benchmark.run_bench linebreaks --limit 60   # line-break quality
+```
+
+`linebreaks` scores the transcription path's line grouping rather than its
+timing. It caches Whisper output *before* splitting, so the splitter can be
+re-tuned in seconds instead of re-transcribing. It reports the *dangling break
+rate* — the share of line breaks that fall after a word which syntactically
+demands a continuation ("...the feeling is | lightning") — alongside break
+precision/recall against the human line breaks in each file's USLT sheet.
+
+Point it at a different library with `--library` or `SYLTGEN_BENCH_LIBRARY`.
+Model output is cached per variant under `tests/benchmark/.cache/`, so
+re-scoring a finished run is instant.
 
 ## Debugging in VS Code
 

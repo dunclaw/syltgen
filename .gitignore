@@ -36,3 +36,7 @@ output/
 
 # VSCode local overrides
 .vscode/extensions.json
+
+# Benchmark artifacts (library index, cached model output, result sets)
+tests/benchmark/.cache/
+tests/benchmark/.results/

@@ -231,41 +231,26 @@ def process_song(
         else:
             logger.debug("Using pre-copied patched output '%s'.", dest_path)
 
-        # Separate vocals for all tracks. Using clean vocal stems gives the
-        # WhisperX coarse pass (and any full-transcription baseline) much better
-        # temporal precision than running on the raw mix — this matters especially
-        # for USLT forced-alignment where seed timing feeds directly into line
-        # placement.
+        # Separate vocals for all tracks. Using clean vocal stems gives both the
+        # forced aligner and the full-transcription baseline much better temporal
+        # precision than running on the raw mix.
         unsynced = existing_unsynced if existing_unsynced is not None else read_uslt_lyrics(mp3_path)
 
         if unsynced:
-            # For forced alignment we already know the words — the model only needs to
-            # find *when* they occur.  Use the original MP3 directly: stem separation
-            # introduces bleed-through artifacts that can fool the aligner into
-            # anchoring the first lines to early spurious matches in the intro.
-            logger.info("Found USLT lyrics – using forced alignment on original audio.")
+            logger.info("Found USLT lyrics – using forced alignment on separated vocals.")
+        else:
+            logger.info("No USLT lyrics – using full transcription on separated vocals.")
+
+        with tempfile.TemporaryDirectory(prefix="syltgen_stems_") as tmp_stems:
+            vocals_path = separate_vocals(mp3_path, tmp_stems, model_name=sep_model)
             segments = transcribe_and_align(
-                mp3_path,
-                unsynced_lyrics=unsynced,
+                vocals_path,
+                unsynced_lyrics=unsynced or None,
                 model_name=whisper_model,
                 device=device,
                 compute_type=compute_type,
                 language=language,
             )
-        else:
-            # No lyrics — full transcription needs clean vocal stems so Whisper can
-            # hear words clearly without the backing track drowning them out.
-            logger.info("No USLT lyrics – using full transcription on separated vocals.")
-            with tempfile.TemporaryDirectory(prefix="syltgen_stems_") as tmp_stems:
-                vocals_path = separate_vocals(mp3_path, tmp_stems, model_name=sep_model)
-                segments = transcribe_and_align(
-                    vocals_path,
-                    unsynced_lyrics=None,
-                    model_name=whisper_model,
-                    device=device,
-                    compute_type=compute_type,
-                    language=language,
-                )
 
         if not segments:
             logger.info("SKIP '%s' – no credible lyrics detected (instrumental or transcription failed).", mp3_path.name)
